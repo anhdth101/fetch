@@ -251,17 +251,32 @@ def scheduler():
 
     send_telegram("🚀 <b>Battlefield Bot v7 Online</b>")
 
-    send_telegram("🧪 TEST REPORT\n" + build_report())
+    # ===== TEST REPORT =====
+    try:
+        report = build_report()
+        send_telegram("🧪 TEST REPORT\n" + report)
+    except Exception as e:
+        logger.error(f"TEST REPORT ERROR: {e}")
+        send_telegram(f"❌ Test report failed:\n{e}")
 
+    # ===== LOOP =====
     while True:
 
-        now = datetime.now(TIMEZONE).strftime("%H:%M")
+        try:
 
-        if now in REPORT_TIMES:
+            now = datetime.now(TIMEZONE).strftime("%H:%M")
 
-            send_telegram(build_report())
+            if now in REPORT_TIMES:
 
-            time.sleep(60)
+                report = build_report()
+                send_telegram(report)
+
+                time.sleep(60)
+
+        except Exception as e:
+
+            logger.error(f"Scheduler error: {e}")
+            send_telegram(f"⚠️ Bot error:\n{e}")
 
         time.sleep(10)
 
