@@ -7,13 +7,14 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from flask import Flask
 import logging
 import threading
+import time
 
 # ================= CONFIG =================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = "5047088212"
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "5047088212")
 
 if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN not set!")
+    raise ValueError("TELEGRAM_TOKEN not set in Render Environment Variables!")
 
 SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 
@@ -26,33 +27,58 @@ REPORT_SCHEDULE = [
 ]
 
 # ================= LOGGING =================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 logger = logging.getLogger("BattlefieldBot")
 
-logger.info("=== BATTLEFIELD BOT v1.5 - Render Web Service Ready ===")
+logger.info("=== BATTLEFIELD INTELLIGENCE BOT v1.7 - FINAL Render Web Service Edition ===")
+logger.info(f"Telegram Chat ID: {TELEGRAM_CHAT_ID}")
+logger.info("Using Binance.US to avoid 451 restricted location error on Render")
 
 # ================= EXCHANGE =================
-exchange = ccxt.binance({
+# Dùng binanceus để tránh block IP Render (US-based)
+# Nếu muốn quay lại binance global → thay binanceus bằng binance + thêm proxies residential
+exchange = ccxt.binanceus({
     "enableRateLimit": True,
-    "timeout": 20000,
-    "options": {"defaultType": "future", "adjustForTimeDifference": True}
+    "timeout": 30000,
+    "options": {
+        "defaultType": "future",
+        "adjustForTimeDifference": True,
+    }
+    # Nếu dùng proxy residential sau này (ví dụ):
+    # 'proxies': {
+    #     'http': 'http://user:pass@ip:port',
+    #     'https': 'http://user:pass@ip:port',
+    # }
 })
 
-# ================= TELEGRAM =================
-def send_telegram(text: str):
+# ================= TELEGRAM WITH RETRY =================
+def send_telegram(text: str, retries=1):
     text = text[:3900] + "..." if len(text) > 3900 else text
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }, timeout=12).raise_for_status()
-    except Exception as e:
-        logger.error(f"Telegram failed: {e}")
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
 
-# ================= DATA FETCH (giữ nguyên như cũ, rút gọn comment) =================
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(url, data=payload, timeout=15)
+            resp.raise_for_status()
+            logger.info(f"Telegram sent successfully (attempt {attempt+1})")
+            return True
+        except Exception as e:
+            logger.error(f"Telegram failed (attempt {attempt+1}): {e}")
+            if attempt < retries:
+                time.sleep(3)  # retry sau 3s
+    return False
+
+# ================= DATA FETCH =================
 def fetch_market_data(symbol: str) -> dict | None:
     try:
         ticker = exchange.fetch_ticker(symbol)
@@ -103,18 +129,18 @@ def fetch_market_data(symbol: str) -> dict | None:
             "oi_changes": oi_changes, "deltas": deltas
         }
     except Exception as e:
-        logger.error(f"Data error {symbol}: {e}")
+        logger.error(f"Data fetch error for {symbol}: {str(e)}")
         return None
 
-# ================= REPORT (giữ nguyên) =================
+# ================= REPORT =================
 def generate_report(label: str):
-    now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
     report = f"🔥 <b>BATTLEFIELD REPORT</b> — {label}\nTime: {now}\n\n"
 
     for asset, sym in [("BTC", "BTC/USDT:USDT"), ("ETH", "ETH/USDT:USDT")]:
         data = fetch_market_data(sym)
         if not data:
-            report += f"<b>{asset}</b>\nDATA ERROR\n\n"
+            report += f"<b>{asset}</b>\nDATA ERROR (check logs)\n\n"
             continue
 
         oi_str = " | ".join(
@@ -125,45 +151,57 @@ def generate_report(label: str):
 
         report += f"""<b>{asset}</b>
 
-Price: {data['price']:,.2f} | H/L: {data['high']:,.2f}/{data['low']:,.2f}
+Price: {data['price']:,.2f} | H/L: {data['high']:,.2f} / {data['low']:,.2f}
 Vol: {data['volume_usdt']:,.0f} USDT | Funding: {data['funding']:.4f}%
 OI: {data['oi_usd']:,.0f} USD | OI Δ: {oi_str}
 Taker: {data['taker_buy_pct']}% ({data['flow_label']})
-OB: {data['imbalance']:.2f}x
+OB Pressure: {data['imbalance']:.2f}x
 Momentum: {mom_str}
 
 """
-    logger.info(report.strip())
+
+    logger.info("Generated report:\n" + report.strip())
     send_telegram(report)
 
 # ================= SCHEDULER =================
-scheduler = BlockingScheduler(timezone="Asia/Ho_Chi_Minh")
+scheduler = BlockingScheduler(timezone="Asia/Ho_Chi_Minh", job_defaults={'misfire_grace_time': 300})
 
 for h, m, label in REPORT_SCHEDULE:
-    scheduler.add_job(generate_report, "cron", hour=h, minute=m, args=[label],
-                      id=f"report-{h:02d}{m:02d}", misfire_grace_time=300)
+    scheduler.add_job(
+        generate_report,
+        "cron",
+        hour=h,
+        minute=m,
+        args=[label],
+        id=f"report-{h:02d}-{m:02d}",
+    )
 
-logger.info("Scheduler ready")
+logger.info(f"Scheduler registered {len(REPORT_SCHEDULE)} jobs")
 
-# Test startup
-generate_report("TEST REPORT (STARTUP)")
-send_telegram("🚀 BOT STARTED on Render Web Service")
-
-# ================= FLASK DUMMY SERVER =================
+# ================= FLASK DUMMY =================
 app = Flask(__name__)
 
 @app.route("/")
 def health():
-    return "Battlefield Bot is alive!"
+    return "Battlefield Bot is alive! (Render Web Service)"
 
-# Chạy scheduler trong thread riêng, Flask ở main thread
+# ================= STARTUP =================
 def run_scheduler():
+    logger.info("Starting APScheduler...")
     try:
         scheduler.start()
     except Exception as e:
-        logger.critical(f"Scheduler error: {e}")
+        logger.critical(f"Scheduler crashed: {e}")
 
 if __name__ == "__main__":
+    # Test startup
+    logger.info("Sending startup test message...")
+    send_telegram("🚀 BOT STARTED SUCCESSFULLY on Render Web Service v1.7")
+
+    generate_report("TEST REPORT (STARTUP)")
+
+    # Run scheduler in background thread
     threading.Thread(target=run_scheduler, daemon=True).start()
-    # Gunicorn sẽ override phần này, không cần app.run() nữa
-    # Chỉ giữ app để gunicorn import
+
+    logger.info("Bot fully initialized. Waiting for Gunicorn to serve Flask dummy endpoint.")
+    # Không app.run() → Gunicorn sẽ handle
