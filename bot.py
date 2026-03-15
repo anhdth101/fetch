@@ -83,3 +83,41 @@ if __name__ == "__main__":
     threading.Thread(target=start_bot, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+    import os, requests, threading, time, logging
+from flask import Flask
+
+# Cấu hình lấy từ Environment Variables trên Render
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger("DebugBot")
+
+def test_send():
+    if not TOKEN or not CHAT_ID:
+        logger.error("❌ LỖI: Render chưa nạp được TOKEN hoặc CHAT_ID. Kiểm tra tab Environment!")
+        return
+
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": "🔔 Test kết nối: Bot v3.3 đã sống!"}
+    
+    try:
+        r = requests.post(url, data=payload, timeout=10)
+        # Dòng này cực quan trọng, nó sẽ hiện trong log Render
+        logger.info(f"📡 Trạng thái Telegram: {r.status_code} - {r.text}")
+    except Exception as e:
+        logger.error(f"❌ Lỗi kết nối mạng: {e}")
+
+app = Flask(__name__)
+@app.route("/")
+def health(): return "ONLINE", 200
+
+def run_debug():
+    time.sleep(5)
+    logger.info("--- ĐANG GỬI TIN NHẮN THỬ NGHIỆM ---")
+    test_send()
+
+if __name__ == "__main__":
+    threading.Thread(target=run_debug, daemon=True).start()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
