@@ -9,7 +9,8 @@ import pytz
 from flask import Flask
 from dotenv import load_dotenv
 
-# ===== ENV =====
+# ================= ENV =================
+
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -17,96 +18,48 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEZONE = pytz.timezone("Asia/Ho_Chi_Minh")
 
-# ===== LOG =====
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("battlefield")
 
-# ===== WEB SERVER =====
+# ================= WEB SERVER =================
+
 app = Flask(__name__)
 
 @app.route("/")
 def health():
     return "SYSTEM ALIVE",200
 
-# ===== TELEGRAM =====
+# ================= TELEGRAM =================
+
 def send_telegram(msg):
 
     if not TOKEN or not CHAT_ID:
-        logger.error("Telegram config missing")
+        logger.error("Missing Telegram config")
         return
 
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    url=f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
     try:
         requests.post(
             url,
             data={
-                "chat_id": CHAT_ID,
-                "text": msg,
-                "parse_mode": "HTML"
+                "chat_id":CHAT_ID,
+                "text":msg,
+                "parse_mode":"HTML"
             },
             timeout=20
         )
     except Exception as e:
         logger.error(e)
 
+# ================= EXCHANGE =================
 
-# ===== EXCHANGE =====
 exchange = ccxt.okx({
     "enableRateLimit": True
 })
 
-# ===== STORAGE =====
-oi_history = []
+# ================= UTILS =================
 
-# ===== OKX API =====
-def get_open_interest():
-
-    url = "https://www.okx.com/api/v5/public/open-interest"
-
-    params = {"instId":"BTC-USDT-SWAP"}
-
-    r = requests.get(url,params=params,timeout=10)
-
-    data = r.json()
-
-    return float(data["data"][0]["oi"])
-
-
-def get_funding():
-
-    url = "https://www.okx.com/api/v5/public/funding-rate"
-
-    params = {"instId":"BTC-USDT-SWAP"}
-
-    r = requests.get(url,params=params,timeout=10)
-
-    data = r.json()
-
-    return float(data["data"][0]["fundingRate"])
-
-
-# ===== MARKET DATA =====
-def get_price():
-
-    ticker = exchange.fetch_ticker("BTC/USDT:USDT")
-
-    return ticker["last"]
-
-
-def get_ohlc():
-
-    data = exchange.fetch_ohlcv("BTC/USDT:USDT","5m",limit=120)
-
-    highs = [x[2] for x in data]
-    lows = [x[3] for x in data]
-    closes = [x[4] for x in data]
-    volumes = [x[5] for x in data]
-
-    return highs,lows,closes,volumes
-
-
-# ===== UTILS =====
 def pct(a,b):
 
     if b == 0:
@@ -115,100 +68,88 @@ def pct(a,b):
     return (a-b)/b*100
 
 
-def calc_oi_delta():
+# ================= SYMBOL REPORT =================
 
-    if len(oi_history) < 4:
-        return 0,0,0
+def get_symbol_report(symbol,inst):
 
-    oi5 = pct(oi_history[-1],oi_history[-2])
-    oi15 = pct(oi_history[-1],oi_history[-3])
-    oi60 = pct(oi_history[-1],oi_history[0])
+    ticker = exchange.fetch_ticker(symbol)
 
-    return oi5,oi15,oi60
+    price = ticker["last"]
 
+    ohlc = exchange.fetch_ohlcv(symbol,"5m",limit=120)
 
-# ===== WHALE DETECT =====
-def whale_trades():
+    highs=[x[2] for x in ohlc]
+    lows=[x[3] for x in ohlc]
+    closes=[x[4] for x in ohlc]
+    volumes=[x[5] for x in ohlc]
 
-    trades = exchange.fetch_trades("BTC/USDT",limit=50)
+    high6=max(highs[-72:])
+    low6=min(lows[-72:])
 
-    whales = []
+    vol5=pct(volumes[-1],volumes[-2])
+    vol15=pct(volumes[-1],volumes[-3])
+    vol1h=pct(volumes[-1],volumes[-12])
 
-    for t in trades:
+    mom5=pct(closes[-1],closes[-2])
+    mom15=pct(closes[-1],closes[-3])
+    mom1h=pct(closes[-1],closes[-12])
 
-        value = t["price"] * t["amount"]
+    funding_url="https://www.okx.com/api/v5/public/funding-rate"
+    funding=requests.get(funding_url,params={"instId":inst}).json()
+    funding=float(funding["data"][0]["fundingRate"])
 
-        if value > 100000:
+    oi_url="https://www.okx.com/api/v5/public/open-interest"
+    oi=requests.get(oi_url,params={"instId":inst}).json()
+    oi=float(oi["data"][0]["oi"])
 
-            side = t["side"].upper()
-
-            whales.append(f"{side} {int(value/1000)}k")
-
-    return whales[:3]
-
-
-# ===== REPORT =====
-def build_report():
-
-    now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
-
-    price = get_price()
-
-    highs,lows,closes,volumes = get_ohlc()
-
-    high6 = max(highs[-72:])
-    low6 = min(lows[-72:])
-
-    vol_delta = pct(volumes[-1],volumes[-2])
-
-    momentum = pct(closes[-1],closes[-2])
-
-    oi = get_open_interest()
-
-    funding = get_funding()
-
-    oi_history.append(oi)
-
-    if len(oi_history) > 12:
-        oi_history.pop(0)
-
-    oi5,oi15,oi60 = calc_oi_delta()
-
-    whales = whale_trades()
-
-    msg = f"""
-🔥 BATTLEFIELD INTELLIGENCE
-
-BTC/USDT
-
-Price: {price:,.0f}
+    report=f"""
+{symbol}
 
 6H High: {high6:,.0f}
 6H Low : {low6:,.0f}
+Current: {price:,.0f}
 
 Funding: {funding:.4f}%
-
-Open Interest: {oi:,.0f}
-
-OI Δ
-5m: {oi5:.2f}%
-15m: {oi15:.2f}%
-1h: {oi60:.2f}%
+OI: {oi:,.0f}
 
 Volume Δ
-5m: {vol_delta:.2f}%
+5m: {vol5:.2f}% | 15m: {vol15:.2f}% | 1h: {vol1h:.2f}%
 
 Momentum
-5m: {momentum:.2f}%
+5m: {mom5:.2f}% | 15m: {mom15:.2f}% | 1h: {mom1h:.2f}%
+"""
 
-Whales
-{" ".join(whales) if whales else "None"}
+    return report
+
+
+# ================= REPORT =================
+
+def build_report():
+
+    now=datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
+
+    btc=get_symbol_report("BTC/USDT:USDT","BTC-USDT-SWAP")
+
+    eth=get_symbol_report("ETH/USDT:USDT","ETH-USDT-SWAP")
+
+    liquidation="Liquidation: Long 0M | Short 0M"
+
+    msg=f"""
+🔥 BATTLEFIELD INTELLIGENCE REPORT
+Time: {now}
+
+{btc}
+
+{eth}
+
+{liquidation}
 """
 
     return msg
 
 
-# ===== SCHEDULER =====
+# ================= SCHEDULER =================
+
 def scheduler():
 
     send_telegram("🚀 Battlefield Bot v7 Online")
@@ -222,7 +163,7 @@ def scheduler():
 
         try:
 
-            report = build_report()
+            report=build_report()
 
             send_telegram(report)
 
@@ -233,11 +174,12 @@ def scheduler():
         time.sleep(3600)
 
 
-# ===== MAIN =====
+# ================= MAIN =================
+
 if __name__ == "__main__":
 
     threading.Thread(target=scheduler,daemon=True).start()
 
-    port = int(os.environ.get("PORT",10000))
+    port=int(os.environ.get("PORT",10000))
 
     app.run(host="0.0.0.0",port=port)
