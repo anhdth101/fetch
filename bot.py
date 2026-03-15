@@ -17,8 +17,16 @@ print("Open Interest + OI Change + Taker Flow")
 
 # ================= EXCHANGE =================
 exchange = ccxt.binance({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'future'}
+    "enableRateLimit": True,
+    "options": {
+        "defaultType": "future"
+    },
+    "urls": {
+        "api": {
+            "public": "https://fapi.binance.com/fapi/v1",
+            "private": "https://fapi.binance.com/fapi/v1"
+        }
+    }
 })
 
 # ================= TELEGRAM =================
