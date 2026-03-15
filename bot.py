@@ -1,3 +1,4 @@
+import os
 import ccxt
 import requests
 import time
@@ -5,12 +6,15 @@ from datetime import datetime
 import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
 
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = "5047088212"
+
 print("=== BATTLEFIELD INTELLIGENCE BOT v1.3 24/7 ===")
 print("Chế độ chạy liên tục 24/7 - Báo cáo tự động trước session")
 print("Open Interest + OI Change 1m/5m/15m/30m/1h + Taker Flow")
 
 # ================= CONFIG =================
-TOKEN = "8748933238:AAFO6Crfew1PfxuPrpU6paLF3KV4x8LkKLw"
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = "5047088212"
 
 SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
