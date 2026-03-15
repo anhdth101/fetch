@@ -142,7 +142,7 @@ def calc_oi_delta():
 
 def whale_trades():
 
-    trades = exchange.fetch_trades("BTC/USDT:USDT", limit=50)
+    trades = exchange.fetch_trades("BTC/USDT", limit=50)
 
     whales = []
 
