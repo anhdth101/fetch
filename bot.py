@@ -245,8 +245,9 @@ for h,m,label in report_times:
 
 print("Scheduler ready")
 
-send_telegram("✅ Battlefield Bot started 24/7")
+generate_report("TEST REPORT")
 
+send_telegram("Bot started 24/7")
 
 # ================= WEB SERVER (RENDER KEEP ALIVE) =================
 from flask import Flask
