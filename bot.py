@@ -4,111 +4,82 @@ import pytz
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# ================= CONFIG =================
-TOKEN = "8748933238:AAFO6Crfew1PfxuPrpU6paLF3KV4x8LkKLw"
-CHAT_ID = "5047088212"
-# Đổi lại định dạng Symbol chuẩn nhất của OKX
+# ================= 1. BẢO MẬT (LẤY TỪ RENDER SETTINGS) =================
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
 TIMEZONE = pytz.timezone("Asia/Ho_Chi_Minh")
-
-REPORT_SCHEDULE = [
-    (7, 0, "T-60m"), (7, 30, "T-30m"), (7, 45, "T-15m"), (7, 55, "T-5m"),
-    (15, 0, "T-60m"), (15, 30, "T-30m"), (15, 45, "T-15m"), (15, 55, "T-5m"),
-    (19, 30, "T-60m"), (20, 0, "T-30m"), (20, 15, "T-15m"), (20, 25, "T-5m"),
-]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("BattlefieldBot")
 
-# Cấu hình OKX chuyên dụng
+# Kiểm tra xem bạn đã điền biến trên Render chưa
+if not TOKEN or not CHAT_ID:
+    logger.error("!!! THIẾU BIẾN MÔI TRƯỜNG !!! Hãy vào Render Settings để điền.")
+
 exchange = ccxt.okx({
     'enableRateLimit': True, 
-    'timeout': 30000,
+    'timeout': 15000,
     'options': {'defaultType': 'swap'}
 })
 
 def send_telegram(text):
+    if not TOKEN or not CHAT_ID: return False
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
-        r = requests.post(url, data=payload, timeout=15)
-        logger.info(f"Telegram Resp: {r.status_code}")
-    except Exception as e:
-        logger.error(f"Lỗi gửi Telegram: {e}")
+        r = requests.post(url, data=payload, timeout=10)
+        return r.status_code == 200
+    except: return False
 
-# ================= LOGIC DỮ LIỆU CẢI TIẾN =================
-def fetch_full_data(symbol):
+# ================= 2. LOGIC FETCH DATA =================
+def fetch_with_retry(symbol):
+    data = {"p": 0, "oi": "N/A", "f": "N/A", "status": "Error"}
+    for _ in range(3):
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            data["p"] = ticker['last']
+            data["status"] = "OK"
+            break
+        except: time.sleep(1)
+
+    if data["status"] == "Error": return None
+
     try:
-        # Lấy Ticker trước (Cơ bản nhất)
-        ticker = exchange.fetch_ticker(symbol)
-        p = ticker['last']
-        
-        # Thử lấy OI và Funding, nếu lỗi thì để mặc định 0
-        try:
-            f = exchange.fetch_funding_rate(symbol).get('fundingRate', 0) * 100
-            oi_data = exchange.fetch_open_interest(symbol)
-            oi_usd = float(oi_data.get('openInterestAmount', 0)) * p
-        except:
-            f, oi_usd = 0, 0
+        f_rate = exchange.fetch_funding_rate(symbol)
+        data["f"] = f"{f_rate.get('fundingRate', 0) * 100:.4f}%"
+        oi_res = exchange.fetch_open_interest(symbol)
+        oi_val = float(oi_res.get('openInterestAmount', 0)) * data["p"]
+        data["oi"] = f"${oi_val:,.0f}"
+    except: pass
+    return data
 
-        # Lấy Momentum (Nếu lỗi khung nhỏ thì bỏ qua)
-        moms = {}
-        try:
-            for tf in ["5m", "1h", "1d"]:
-                ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=2)
-                if len(ohlcv) >= 2:
-                    moms[tf] = round(((ohlcv[-1][4] - ohlcv[-2][4]) / ohlcv[-2][4]) * 100, 2)
-        except:
-            moms = {"5m": 0, "1h": 0, "1d": 0}
-
-        label = "BUYING MẠNH" if moms.get('5m', 0) > 0.1 else "SELLING MẠNH" if moms.get('5m', 0) < -0.1 else "NEUTRAL"
-        
-        return {
-            "p": p, "h": ticker.get('high', 0), "l": ticker.get('low', 0), 
-            "v": ticker.get('quoteVolume', 0), "f": f, "oi": oi_usd, 
-            "mom": moms, "lb": label
-        }
-    except Exception as e:
-        logger.error(f"Lỗi fetch {symbol}: {e}")
-        return None
-
-def generate_report(label):
-    now = datetime.now(TIMEZONE).strftime("%H:%M:%S VN")
-    # Thay đổi tiêu đề để nhận diện bản mới
-    msg = f"🔥 <b>BATTLEFIELD v2.3 (FIXED)</b>\n[{label}] | {now}\n\n"
-    
-    has_data = False
+def get_report(label="REPORT"):
+    now = datetime.now(TIMEZONE).strftime("%H:%M:%S")
+    msg = f"🔥 <b>BATTLEFIELD v2.6 (SECURE)</b>\n[{label}] | {now}\n\n"
+    success = False
     for sym in SYMBOLS:
-        d = fetch_full_data(sym)
+        d = fetch_with_retry(sym)
         if d:
-            has_data = True
+            success = True
             name = sym.split('-')[0]
-            mom_str = " | ".join([f"{k}:{'🟢+' if v > 0 else '🔴'}{v}%" for k, v in d['mom'].items()])
-            
-            msg += (f"<b>{name}</b> - Current: <b>{d['p']:,.1f}</b>\n"
-                    f"Vol: {d['v']:,.0f} | Fnd: {d['f']:.4f}% | <b>OI: {d['oi']:,.0f} USD</b>\n"
-                    f"<b>Flow: ({d['lb']})</b>\n"
-                    f"Mom: {mom_str}\n\n")
-    
-    if not has_data:
-        msg += "⚠️ Không lấy được dữ liệu từ sàn OKX. Vui lòng kiểm tra lại kết nối!"
-    
-    send_telegram(msg)
+            msg += f"<b>{name}</b>: <b>{d['p']:,.1f}</b>\nOI: {d['oi']} | Fnd: {d['f']}\n\n"
+    if success: send_telegram(msg)
 
-# ================= KHỞI CHẠY =================
+# ================= 3. KHỞI CHẠY =================
 app = Flask(__name__)
 @app.route("/")
-def health(): return "OK", 200
+def health(): return "ONLINE", 200
 
 def start_bot():
     time.sleep(5)
-    generate_report("RETRY TEST")
+    send_telegram("🚀 <b>Hệ thống v2.6 đã bảo mật!</b>\nĐang quét dữ liệu sàn...")
+    get_report("STARTUP TEST")
     
     sched = BackgroundScheduler(timezone="Asia/Ho_Chi_Minh")
-    for h, m, l in REPORT_SCHEDULE:
-        sched.add_job(generate_report, "cron", hour=h, minute=m, args=[l])
+    sched.add_job(get_report, 'interval', minutes=30)
     sched.start()
-    while True: time.sleep(60)
+    while True: time.sleep(10)
 
 if __name__ == "__main__":
     threading.Thread(target=start_bot, daemon=True).start()
