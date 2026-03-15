@@ -1,30 +1,22 @@
 import os
-import requests
-import threading
 import time
-import logging
 import ccxt
-import numpy as np
-import pytz
+import requests
+import logging
+import threading
 from datetime import datetime
+import pytz
 from flask import Flask
+from dotenv import load_dotenv
 
 # ================= CONFIG =================
+
+load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEZONE = pytz.timezone("Asia/Ho_Chi_Minh")
-
-SYMBOLS = ["BTC/USDT","ETH/USDT"]
-
-SCHEDULE_TIMES = [
-"07:30","07:45","07:55",
-"15:30","15:45","15:55",
-"19:30","20:00","20:15","20:25"
-]
-
-# ================= LOG =================
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("BattlefieldBot")
@@ -35,283 +27,251 @@ app = Flask(__name__)
 
 @app.route("/")
 def health():
-    return "SYSTEM ALIVE",200
+    return "SYSTEM ALIVE", 200
+
 
 # ================= TELEGRAM =================
 
 def send_telegram(msg):
 
     if not TOKEN or not CHAT_ID:
-        logger.error("Telegram config missing")
+        logger.error("Missing telegram config")
         return
 
-    url=f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
     try:
-
-        requests.post(url,data={
-            "chat_id":CHAT_ID,
-            "text":msg,
-            "parse_mode":"HTML"
-        },timeout=20)
-
+        requests.post(
+            url,
+            data={
+                "chat_id": CHAT_ID,
+                "text": msg,
+                "parse_mode": "HTML"
+            },
+            timeout=20
+        )
     except Exception as e:
         logger.error(e)
+
 
 # ================= EXCHANGE =================
 
 exchange = ccxt.okx({
-'enableRateLimit':True
+    "enableRateLimit": True
 })
+
+
+# ================= STORAGE =================
+
+oi_history = []
+price_history = []
+
+
+# ================= OKX DATA =================
+
+def get_open_interest():
+
+    url = "https://www.okx.com/api/v5/public/open-interest"
+
+    params = {"instId": "BTC-USDT-SWAP"}
+
+    r = requests.get(url, params=params)
+
+    data = r.json()
+
+    return float(data["data"][0]["oi"])
+
+
+def get_funding():
+
+    url = "https://www.okx.com/api/v5/public/funding-rate"
+
+    params = {"instId": "BTC-USDT-SWAP"}
+
+    r = requests.get(url, params=params)
+
+    data = r.json()
+
+    return float(data["data"][0]["fundingRate"])
+
 
 # ================= MARKET DATA =================
 
-def get_ohlc(symbol,tf,limit):
+def get_price():
 
-    data = exchange.fetch_ohlcv(symbol,tf,limit=limit)
-    arr = np.array(data)
+    ticker = exchange.fetch_ticker("BTC/USDT:USDT")
 
-    high = arr[:,2]
-    low = arr[:,3]
-    close = arr[:,4]
-    vol = arr[:,5]
+    return ticker["last"]
 
-    return high,low,close,vol
 
-# ================= 6H RANGE =================
+def get_ohlc():
 
-def calc_range_6h(symbol):
+    data = exchange.fetch_ohlcv("BTC/USDT:USDT", "5m", limit=120)
 
-    high,low,close,vol = get_ohlc(symbol,"5m",72)
+    highs = [x[2] for x in data]
+    lows = [x[3] for x in data]
+    closes = [x[4] for x in data]
+    volumes = [x[5] for x in data]
 
-    return max(high),min(low),close[-1]
+    return highs, lows, closes, volumes
 
-# ================= MOMENTUM =================
 
-def momentum(symbol,minutes):
+# ================= CALC =================
 
-    data = exchange.fetch_ohlcv(symbol,"1m",limit=minutes+1)
+def pct(a, b):
 
-    p0 = data[0][4]
-    p1 = data[-1][4]
-
-    return (p1-p0)/p0*100
-
-# ================= VOLUME CHANGE =================
-
-def volume_change(symbol,minutes):
-
-    _,_,_,vol = get_ohlc(symbol,"1m",minutes+1)
-
-    v0 = sum(vol[:-1])
-    v1 = sum(vol)
-
-    if v0==0:
+    if b == 0:
         return 0
 
-    return (v1-v0)/v0*100
+    return (a - b) / b * 100
 
-# ================= FUNDING =================
 
-def get_funding(symbol):
+def calc_oi_delta():
 
-    try:
+    if len(oi_history) < 4:
+        return 0,0,0
 
-        inst=symbol.replace("/","-")+"-SWAP"
+    oi5 = pct(oi_history[-1], oi_history[-2])
+    oi15 = pct(oi_history[-1], oi_history[-3])
+    oi60 = pct(oi_history[-1], oi_history[0])
 
-        r=requests.get(
-        f"https://www.okx.com/api/v5/public/funding-rate?instId={inst}",
-        timeout=10).json()
+    return oi5, oi15, oi60
 
-        return float(r["data"][0]["fundingRate"])*100
-
-    except:
-
-        return 0
-
-# ================= OPEN INTEREST =================
-
-def get_open_interest(symbol):
-
-    try:
-
-        inst=symbol.replace("/","-")+"-SWAP"
-
-        r=requests.get(
-        f"https://www.okx.com/api/v5/public/open-interest?instId={inst}",
-        timeout=10).json()
-
-        return float(r["data"][0]["oi"])
-
-    except:
-
-        return 0
 
 # ================= WHALE DETECT =================
 
-def whale_detect(symbol):
+def whale_trades():
 
-    whales=[]
+    trades = exchange.fetch_trades("BTC/USDT:USDT", limit=50)
 
-    try:
+    whales = []
 
-        trades=exchange.fetch_trades(symbol,limit=50)
+    for t in trades:
 
-        for t in trades:
+        value = t["price"] * t["amount"]
 
-            size=t["amount"]*t["price"]
+        if value > 100000:
 
-            if size>100000:
+            side = t["side"].upper()
 
-                side=t["side"].upper()
-
-                whales.append(f"{side} {int(size/1000)}k")
-
-    except:
-        pass
+            whales.append(f"{side} {int(value/1000)}k")
 
     return whales[:3]
 
-# ================= LIQUIDATION =================
-
-def liquidation():
-
-    try:
-
-        r=requests.get(
-        "https://www.okx.com/api/v5/public/liquidation-orders?instType=SWAP",
-        timeout=10).json()
-
-        data=r.get("data",[])
-
-        long_liq=0
-        short_liq=0
-
-        for x in data:
-
-            v=float(x["sz"])*float(x["px"])
-
-            if x["side"]=="sell":
-                long_liq+=v
-            else:
-                short_liq+=v
-
-        return f"Long {int(long_liq/1000000)}M | Short {int(short_liq/1000000)}M"
-
-    except:
-
-        return "N/A"
-
-# ================= HEALTH CHECK =================
-
-def health_log():
-
-    msg="🩺 <b>HEALTH CHECK</b>\n"
-
-    msg+="Exchange: OKX\n"
-    msg+=f"Symbols: {', '.join(SYMBOLS)}\n"
-
-    try:
-
-        t=exchange.fetch_ticker("BTC/USDT")
-
-        msg+=f"BTC Feed: OK ({int(t['last'])})\n"
-
-    except:
-
-        msg+="BTC Feed: FAIL\n"
-
-    msg+=f"Server Time: {datetime.now(TIMEZONE).strftime('%H:%M:%S')}"
-
-    send_telegram(msg)
 
 # ================= REPORT =================
 
 def build_report():
 
-    now=datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
+    now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
 
-    msg=f"🔥 <b>BATTLEFIELD INTELLIGENCE REPORT</b>\nTime: {now}\n\n"
+    price = get_price()
 
-    for s in SYMBOLS:
+    highs, lows, closes, volumes = get_ohlc()
 
-        high,low,price=calc_range_6h(s)
+    high6 = max(highs[-72:])
+    low6 = min(lows[-72:])
 
-        v5=volume_change(s,5)
-        v15=volume_change(s,15)
-        v60=volume_change(s,60)
+    vol_delta = pct(volumes[-1], volumes[-2])
 
-        m5=momentum(s,5)
-        m15=momentum(s,15)
-        m60=momentum(s,60)
+    momentum = pct(closes[-1], closes[-2])
 
-        funding=get_funding(s)
-        oi=get_open_interest(s)
+    oi = get_open_interest()
+    funding = get_funding()
 
-        whales=whale_detect(s)
+    oi_history.append(oi)
 
-        msg+=f"<b>{s}</b>\n"
-        msg+=f"6H High: {high:,.0f}\n"
-        msg+=f"6H Low : {low:,.0f}\n"
-        msg+=f"Current: {price:,.0f}\n\n"
+    if len(oi_history) > 12:
+        oi_history.pop(0)
 
-        msg+=f"Funding: {funding:.4f}%\n"
-        msg+=f"OI: {oi:,.0f}\n\n"
+    oi5, oi15, oi60 = calc_oi_delta()
 
-        msg+="Volume Δ\n"
-        msg+=f"5m: {v5:.2f}% | 15m: {v15:.2f}% | 1h: {v60:.2f}%\n\n"
+    whales = whale_trades()
 
-        msg+="Momentum\n"
-        msg+=f"5m: {m5:.2f}% | 15m: {m15:.2f}% | 1h: {m60:.2f}%\n\n"
+    bias = "Neutral"
 
-        if whales:
-            msg+="🐋 Whale: "+", ".join(whales)+"\n\n"
+    if momentum > 0 and oi5 > 0:
+        bias = "Bullish"
 
-    msg+=f"Liquidation: {liquidation()}"
+    if momentum < 0 and oi5 > 0:
+        bias = "Bearish"
+
+    msg = f"""
+🔥 <b>BATTLEFIELD INTELLIGENCE V7</b>
+
+Time: {now}
+
+════════ BTC ════════
+
+Price: <code>{price:,.0f}</code>
+
+6H High: {high6:,.0f}
+6H Low : {low6:,.0f}
+
+Funding: {funding:.4f}
+
+Open Interest: {oi:,.0f}
+
+OI Δ
+5m: {oi5:.2f}%
+15m: {oi15:.2f}%
+1h: {oi60:.2f}%
+
+Volume Δ: {vol_delta:.2f}%
+
+Momentum: {momentum:.2f}%
+
+Whales:
+{" ".join(whales) if whales else "None"}
+
+════════ MARKET BIAS ════════
+
+{bias}
+
+Trade Setup
+
+LONG if BTC > {high6:,.0f}
+
+SHORT if BTC < {low6:,.0f}
+"""
 
     return msg
 
+
 # ================= SCHEDULER =================
+
+REPORT_TIMES = [
+"07:30","07:45","07:55",
+"15:30","15:45","15:55",
+"19:30","20:00","20:15","20:25"
+]
+
 
 def scheduler():
 
-    send_telegram("🚀 <b>Battlefield Bot Online</b>")
+    send_telegram("🚀 <b>Battlefield Bot v7 Online</b>")
 
-    health_log()
-
-    try:
-        send_telegram("🧪 <b>TEST REPORT</b>\n\n"+build_report())
-    except Exception as e:
-        send_telegram(f"❌ TEST REPORT FAILED\n{e}")
-
-    last_hour=None
+    send_telegram("🧪 TEST REPORT\n" + build_report())
 
     while True:
 
-        now=datetime.now(TIMEZONE)
+        now = datetime.now(TIMEZONE).strftime("%H:%M")
 
-        hm=now.strftime("%H:%M")
-
-        if hm in SCHEDULE_TIMES:
+        if now in REPORT_TIMES:
 
             send_telegram(build_report())
 
             time.sleep(60)
 
-        if last_hour!=now.hour:
-
-            send_telegram(build_report())
-
-            last_hour=now.hour
-
         time.sleep(10)
+
 
 # ================= MAIN =================
 
-if __name__=="__main__":
+if __name__ == "__main__":
 
-    threading.Thread(target=scheduler,daemon=True).start()
+    threading.Thread(target=scheduler, daemon=True).start()
 
-    port=int(os.environ.get("PORT",10000))
+    port = int(os.environ.get("PORT", 10000))
 
-    app.run(host="0.0.0.0",port=port)
+    app.run(host="0.0.0.0", port=port)
