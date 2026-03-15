@@ -16,11 +16,9 @@ print("=== BATTLEFIELD INTELLIGENCE BOT v1.3 24/7 ===")
 print("Open Interest + OI Change + Taker Flow")
 
 # ================= EXCHANGE =================
-exchange = ccxt.binance({
-    "enableRateLimit": True,
-    "options": {
-        "defaultType": "future"
-    },
+exchange = ccxt.binanceusdm({
+    "enableRateLimit": True
+})
     "urls": {
         "api": {
             "public": "https://fapi.binance.com/fapi/v1",
