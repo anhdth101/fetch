@@ -6,292 +6,267 @@ import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
 from flask import Flask
 import threading
+import logging
 
-# ================= CONFIG =================
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = "5047088212"
+# ================= CONFIGURATION =================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = "5047088212"           # Thay bằng chat id của bạn nếu cần
 
-if not TOKEN:
-    raise Exception("TELEGRAM_TOKEN not set")
+if not TELEGRAM_TOKEN:
+    raise ValueError("Environment variable TELEGRAM_TOKEN is not set")
 
-SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+SYMBOLS = [
+    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+]
 
-VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
+TIMEZONE = pytz.timezone("Asia/Ho_Chi_Minh")
+
+# Báo cáo sẽ được gửi vào các mốc thời gian này (giờ VN)
+REPORT_SCHEDULE = [
+    (7,  0,  "T-60m"),
+    (7,  30, "T-30m"),
+    (7,  45, "T-15m"),
+    (7,  55, "T-5m"),
+
+    (15, 0,  "T-60m"),
+    (15, 30, "T-30m"),
+    (15, 45, "T-15m"),
+    (15, 55, "T-5m"),
+
+    (19, 30, "T-60m"),
+    (20, 0,  "T-30m"),
+    (20, 15, "T-15m"),
+    (20, 25, "T-5m"),
+]
+
+# ================= LOGGING =================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("BattlefieldBot")
 
 print("=== BATTLEFIELD INTELLIGENCE BOT v1.3 ===")
 
-# ================= EXCHANGE =================
+# ================= BINANCE EXCHANGE =================
 exchange = ccxt.binance({
     "enableRateLimit": True,
     "timeout": 20000,
-    "options": {"defaultType": "future"}
+    "options": {
+        "defaultType": "future",
+        "adjustForTimeDifference": True,
+    }
 })
 
-# ================= TELEGRAM =================
-def send_telegram(message):
+# ================= TELEGRAM SENDER =================
+def send_telegram_message(text: str):
+    if len(text) > 3900:
+        text = text[:3900] + "... (truncated)"
 
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
     try:
-
-        if len(message) > 3900:
-            message = message[:3900]
-
-        requests.post(
+        resp = requests.post(
             url,
             data={
-                "chat_id": CHAT_ID,
-                "text": message,
-                "parse_mode": "HTML"
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
             },
-            timeout=10
+            timeout=12
         )
-
+        resp.raise_for_status()
     except Exception as e:
-        print("Telegram error:", e)
+        logger.error(f"Telegram send failed: {e}")
 
 
-# ================= MARKET DATA =================
-def get_asset_data(symbol):
-
+# ================= DATA FETCHER =================
+def fetch_market_data(symbol: str) -> dict | None:
     try:
-
         ticker = exchange.fetch_ticker(symbol)
-        ob = exchange.fetch_order_book(symbol, limit=20)
+        orderbook = exchange.fetch_order_book(symbol, limit=20)
 
-        bids = sum(b[1] for b in ob["bids"])
-        asks = sum(a[1] for a in ob["asks"]) or 1
-
-        imbalance = bids / asks
+        bids_volume = sum(b[1] for b in orderbook["bids"])
+        asks_volume = sum(a[1] for a in orderbook["asks"]) or 1.0
+        orderbook_imbalance = bids_volume / asks_volume
 
         price = ticker["last"]
         high = ticker["high"]
         low = ticker["low"]
-        volume = ticker["quoteVolume"]
+        quote_volume = ticker["quoteVolume"] or 0
 
-        # OPEN INTEREST
-        oi_raw = exchange.fetch_open_interest(symbol)
-        oi_contracts = float(oi_raw.get("openInterest", 0))
+        # Open Interest
+        oi_data = exchange.fetch_open_interest(symbol)
+        oi_contracts = float(oi_data.get("openInterest", 0))
         oi_usd = oi_contracts * price
 
-        # TAKER FLOW
+        # Taker Buy/Sell flow
         info = ticker.get("info", {})
-
         taker_buy_quote = float(info.get("takerBuyQuoteVolume", 0))
-        total_vol = float(volume or 1)
+        total_volume = float(quote_volume or 1)
+        taker_buy_ratio = round((taker_buy_quote / total_volume) * 100, 1)
 
-        taker_buy_pct = round((taker_buy_quote / total_vol) * 100, 1)
-
-        if taker_buy_pct > 52:
-            flow_label = "TAKER BUYING"
-        elif taker_buy_pct < 48:
-            flow_label = "TAKER SELLING"
+        if taker_buy_ratio > 52:
+            flow_status = "TAKER BUYING"
+        elif taker_buy_ratio < 48:
+            flow_status = "TAKER SELLING"
         else:
-            flow_label = "NEUTRAL"
+            flow_status = "NEUTRAL"
 
-        # OI CHANGE
+        # Open Interest changes
         oi_changes = {}
-
-        for tf in ["1m", "5m", "15m", "30m", "1h"]:
-
+        for timeframe in ["1m", "5m", "15m", "30m", "1h"]:
             try:
-
-                hist = exchange.fetch_open_interest_history(symbol, tf, limit=2)
-
-                if len(hist) >= 2:
-
-                    prev = float(hist[-2]["openInterest"])
-                    curr = float(hist[-1]["openInterest"])
-
-                    pct = ((curr - prev) / prev) * 100 if prev else 0
-                    oi_changes[tf] = round(pct, 2)
-
+                history = exchange.fetch_open_interest_history(symbol, timeframe, limit=2)
+                if len(history) >= 2:
+                    prev = float(history[-2]["openInterest"])
+                    curr = float(history[-1]["openInterest"])
+                    change_pct = ((curr - prev) / prev * 100) if prev != 0 else 0
+                    oi_changes[timeframe] = round(change_pct, 2)
                 else:
-                    oi_changes[tf] = 0
+                    oi_changes[timeframe] = "N/A"
+            except Exception:
+                oi_changes[timeframe] = "N/A"
 
-            except:
-                oi_changes[tf] = "N/A"
-
-        # MOMENTUM
-        deltas = {}
-
-        for tf in ["5m", "15m", "1h", "4h", "8h", "1d"]:
-
+        # Price momentum
+        price_changes = {}
+        for timeframe in ["5m", "15m", "1h", "4h", "8h", "1d"]:
             try:
-
-                ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=2)
-
-                if len(ohlcv) >= 2:
-
-                    prev = ohlcv[-2][4]
-                    curr = ohlcv[-1][4]
-
-                    deltas[tf] = round((curr - prev) / prev * 100, 2)
-
+                candles = exchange.fetch_ohlcv(symbol, timeframe, limit=2)
+                if len(candles) >= 2:
+                    prev_close = candles[-2][4]
+                    curr_close = candles[-1][4]
+                    pct = (curr_close - prev_close) / prev_close * 100
+                    price_changes[timeframe] = round(pct, 2)
                 else:
-                    deltas[tf] = 0
+                    price_changes[timeframe] = 0.0
+            except Exception:
+                price_changes[timeframe] = 0.0
 
-            except:
-                deltas[tf] = 0
-
-        funding = exchange.fetch_funding_rate(symbol).get("fundingRate", 0) * 100
+        funding_rate = exchange.fetch_funding_rate(symbol).get("fundingRate", 0) * 100
 
         return {
             "price": price,
             "high": high,
             "low": low,
-            "volume": volume,
-            "imbalance": imbalance,
-            "funding": funding,
+            "volume_usdt": quote_volume,
+            "orderbook_imbalance": orderbook_imbalance,
+            "funding_rate_pct": funding_rate,
             "oi_usd": oi_usd,
-            "taker_buy_pct": taker_buy_pct,
-            "flow_label": flow_label,
+            "taker_buy_pct": taker_buy_ratio,
+            "taker_flow": flow_status,
             "oi_changes": oi_changes,
-            "deltas": deltas
+            "price_changes": price_changes
         }
 
     except Exception as e:
-
-        print("DATA ERROR:", symbol, e)
+        logger.error(f"Failed to fetch data for {symbol}: {str(e)}")
         return None
 
 
-# ================= REPORT =================
-def generate_report(label):
-
-    now = datetime.now(VN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+# ================= REPORT GENERATOR =================
+def generate_battlefield_report(label: str):
+    now_vn = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
     report = f"""
-🔥 <b>BATTLEFIELD REPORT</b>
-{label}
-
-Time: {now}
+🔥 <b>BATTLEFIELD REPORT</b>  —  {label}
+Time: {now_vn}
 
 """
 
-    for asset in ["BTC", "ETH"]:
-
-        symbol = f"{asset}/USDT:USDT"
-        data = get_asset_data(symbol)
+    for asset, symbol in [("BTC", "BTC/USDT:USDT"), ("ETH", "ETH/USDT:USDT")]:
+        data = fetch_market_data(symbol)
 
         if not data:
-            report += f"{asset} DATA ERROR\n"
+            report += f"<b>{asset}</b>\nDATA ERROR\n\n"
             continue
 
-        oi_delta = []
-
+        oi_deltas = []
         for tf in ["1m", "5m", "15m", "30m", "1h"]:
-
-            val = data["oi_changes"][tf]
-
+            val = data["oi_changes"].get(tf)
             if isinstance(val, str):
-                oi_delta.append(f"{tf}:{val}")
+                oi_deltas.append(f"{tf}:{val}")
             else:
-                oi_delta.append(f"{tf}:{val:+.2f}%")
+                oi_deltas.append(f"{tf}:{val:+.2f}%")
 
-        oi_delta_str = " | ".join(oi_delta)
+        momentum_lines = []
+        for tf in ["5m", "15m", "1h", "4h", "8h", "1d"]:
+            pct = data["price_changes"].get(tf, 0)
+            momentum_lines.append(f"{tf} {pct:+.2f}%")
 
         report += f"""
 <b>{asset}</b>
 
-Price: {data['price']:,.2f}
-High: {data['high']:,.2f}  Low: {data['low']:,.2f}
+Price:          {data['price']:,.2f} USDT
+High / Low:     {data['high']:,.2f}  /  {data['low']:,.2f}
 
-Volume: {data['volume']:,.0f}
+Volume (24h):   {data['volume_usdt']:,.0f} USDT
 
-Funding: {data['funding']:.4f}%
+Funding Rate:   {data['funding_rate_pct']:.4f}%
 
-OI: {data['oi_usd']:,.0f} USD
-OI Δ: {oi_delta_str}
+OI:             {data['oi_usd']:,.0f} USD
+OI Δ:           {' | '.join(oi_deltas)}
 
-Taker Flow:
-{data['taker_buy_pct']}% ({data['flow_label']})
+Taker Flow:     {data['taker_buy_pct']}%  ({data['taker_flow']})
 
-Orderbook Pressure:
-{data['imbalance']:.2f}x
+Orderbook:      {data['orderbook_imbalance']:.2f}x bids pressure
 
 Momentum:
-5m {data['deltas']['5m']}%
-15m {data['deltas']['15m']}%
-1h {data['deltas']['1h']}%
-4h {data['deltas']['4h']}%
-8h {data['deltas']['8h']}%
-1d {data['deltas']['1d']}%
+{' | '.join(momentum_lines)}
 
 """
 
-    print(report)
-
-    send_telegram(report)
-
-
-# ================= SCHEDULER =================
-sched = BlockingScheduler(timezone="Asia/Ho_Chi_Minh")
-
-report_times = [
-
-    (7,0,"T-60m"),
-    (7,30,"T-30m"),
-    (7,45,"T-15m"),
-    (7,55,"T-5m"),
-
-    (15,0,"T-60m"),
-    (15,30,"T-30m"),
-    (15,45,"T-15m"),
-    (15,55,"T-5m"),
-
-    (19,30,"T-60m"),
-    (20,0,"T-30m"),
-    (20,15,"T-15m"),
-    (20,25,"T-5m")
-
-]
-
-for h, m, label in report_times:
-
-    sched.add_job(
-        generate_report,
-        "cron",
-        hour=h,
-        minute=m,
-        args=[label]
-    )
-
-print("Scheduler ready")
-
-generate_report("TEST REPORT")
-
-send_telegram("BOT STARTED 24/7")
+    logger.info(report.strip())
+    send_telegram_message(report)
 
 
-# ================= WEB SERVER =================
+# ================= FLASK KEEP-ALIVE SERVER =================
 app = Flask(__name__)
 
 @app.route("/")
-def home():
-    return "BOT RUNNING"
+def health_check():
+    return "Battlefield Bot is running..."
 
-
-def run_web():
-
+def run_flask_server():
     port = int(os.environ.get("PORT", 10000))
-
     app.run(
         host="0.0.0.0",
-        port=port
+        port=port,
+        debug=False,
+        use_reloader=False
     )
 
 
-threading.Thread(target=run_web, daemon=True).start()
-
-
-# ================= START =================
+# ================= MAIN =================
 if __name__ == "__main__":
+    # Start Flask in background thread (for render.com / railway / heroku / etc.)
+    threading.Thread(target=run_flask_server, daemon=True).start()
+
+    scheduler = BlockingScheduler(timezone="Asia/Ho_Chi_Minh")
+
+    for hour, minute, label in REPORT_SCHEDULE:
+        scheduler.add_job(
+            generate_battlefield_report,
+            "cron",
+            hour=hour,
+            minute=minute,
+            args=[label],
+            id=f"report-{hour:02d}{minute:02d}",
+            misfire_grace_time=300
+        )
+
+    logger.info("Scheduler jobs registered. Starting bot...")
+
+    # Test run
+    generate_battlefield_report("TEST / MANUAL REPORT")
+    send_telegram_message("🚀 BOT STARTED 24/7")
 
     try:
-
-        sched.start()
-
+        scheduler.start()
     except (KeyboardInterrupt, SystemExit):
-
-        print("BOT STOPPED")
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.critical(f"Scheduler crashed: {e}")
