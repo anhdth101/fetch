@@ -179,6 +179,26 @@ print("Để chạy background 24/7 thật sự: dùng screen/tmux hoặc system
 
 if __name__ == "__main__":
     try:
-        sched.start()
+        scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         print("\nBot dừng an toàn")
+
+# ---- WEB SERVER KEEP ALIVE ----
+from flask import Flask
+import threading
+import os
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "BOT RUNNING"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+threading.Thread(target=run_web).start()
+
+if __name__ == "__main__":
+    scheduler.start()
