@@ -2,9 +2,9 @@ import os, ccxt, requests, threading, time, logging
 from datetime import datetime
 import pytz
 from flask import Flask
-from apscheduler.schedulers.background import BackgroundScheduler
 
-# ================= 1. BẢO MẬT (LẤY TỪ RENDER SETTINGS) =================
+# ================= 1. BẢO MẬT (LẤY TỪ RENDER) =================
+# Tuyệt đối không dán ID thật vào đây để tránh lộ trên GitHub
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
@@ -13,73 +13,71 @@ TIMEZONE = pytz.timezone("Asia/Ho_Chi_Minh")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("BattlefieldBot")
 
-# Kiểm tra xem bạn đã điền biến trên Render chưa
-if not TOKEN or not CHAT_ID:
-    logger.error("!!! THIẾU BIẾN MÔI TRƯỜNG !!! Hãy vào Render Settings để điền.")
-
+# Cấu hình sàn OKX
 exchange = ccxt.okx({
     'enableRateLimit': True, 
-    'timeout': 15000,
+    'timeout': 30000, 
     'options': {'defaultType': 'swap'}
 })
 
 def send_telegram(text):
-    if not TOKEN or not CHAT_ID: return False
+    if not TOKEN or not CHAT_ID:
+        logger.error("Thiếu TOKEN hoặc CHAT_ID. Kiểm tra lại Environment Variables trên Render.")
+        return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
-        r = requests.post(url, data=payload, timeout=10)
-        return r.status_code == 200
-    except: return False
+        r = requests.post(url, data=payload, timeout=15)
+        logger.info(f"Telegram Resp: {r.status_code}")
+    except Exception as e:
+        logger.error(f"Lỗi gửi Telegram: {e}")
 
-# ================= 2. LOGIC FETCH DATA =================
-def fetch_with_retry(symbol):
-    data = {"p": 0, "oi": "N/A", "f": "N/A", "status": "Error"}
-    for _ in range(3):
-        try:
-            ticker = exchange.fetch_ticker(symbol)
-            data["p"] = ticker['last']
-            data["status"] = "OK"
-            break
-        except: time.sleep(1)
-
-    if data["status"] == "Error": return None
-
-    try:
-        f_rate = exchange.fetch_funding_rate(symbol)
-        data["f"] = f"{f_rate.get('fundingRate', 0) * 100:.4f}%"
-        oi_res = exchange.fetch_open_interest(symbol)
-        oi_val = float(oi_res.get('openInterestAmount', 0)) * data["p"]
-        data["oi"] = f"${oi_val:,.0f}"
-    except: pass
-    return data
-
-def get_report(label="REPORT"):
+# ================= 2. LOGIC LẤY DỮ LIỆU SÀN =================
+def get_market_report():
     now = datetime.now(TIMEZONE).strftime("%H:%M:%S")
-    msg = f"🔥 <b>BATTLEFIELD v2.6 (SECURE)</b>\n[{label}] | {now}\n\n"
-    success = False
+    msg = f"📊 <b>BATTLEFIELD v3.1 (SECURE)</b>\n🕒 {now} VN\n\n"
+    
+    has_data = False
     for sym in SYMBOLS:
-        d = fetch_with_retry(sym)
-        if d:
-            success = True
-            name = sym.split('-')[0]
-            msg += f"<b>{name}</b>: <b>{d['p']:,.1f}</b>\nOI: {d['oi']} | Fnd: {d['f']}\n\n"
-    if success: send_telegram(msg)
+        try:
+            # Ưu tiên lấy giá trước (Tránh lỗi tin nhắn trống)
+            ticker = exchange.fetch_ticker(sym)
+            price = ticker['last']
+            
+            # Thử lấy thêm OI và Funding (Nếu lỗi thì bỏ qua, vẫn hiện giá)
+            try:
+                f_rate = exchange.fetch_funding_rate(sym).get('fundingRate', 0) * 100
+                msg += f"<b>{sym.split('-')[0]}</b>: <code>{price:,.1f}</code> | Fnd: {f_rate:.4f}%\n"
+            except:
+                msg += f"<b>{sym.split('-')[0]}</b>: <code>{price:,.1f}</code>\n"
+            
+            has_data = True
+        except Exception as e:
+            logger.error(f"Lỗi fetch {sym}: {e}")
+            msg += f"<b>{sym.split('-')[0]}</b>: ⚠️ Sàn phản hồi chậm\n"
 
-# ================= 3. KHỞI CHẠY =================
+    if has_data:
+        send_telegram(msg)
+
+# ================= 3. KHỞI CHẠY & WEB SERVER =================
 app = Flask(__name__)
 @app.route("/")
-def health(): return "ONLINE", 200
+def health(): return "OK", 200
 
 def start_bot():
     time.sleep(5)
-    send_telegram("🚀 <b>Hệ thống v2.6 đã bảo mật!</b>\nĐang quét dữ liệu sàn...")
-    get_report("STARTUP TEST")
+    # Kiểm tra biến môi trường
+    if not TOKEN or not CHAT_ID:
+        logger.error("KHÔNG TÌM THẤY BIẾN MÔI TRƯỜNG TRÊN RENDER!")
+        return
+        
+    send_telegram("🚀 <b>Hệ thống v3.1 Bảo mật đã Online!</b>")
+    get_market_report()
     
-    sched = BackgroundScheduler(timezone="Asia/Ho_Chi_Minh")
-    sched.add_job(get_report, 'interval', minutes=30)
-    sched.start()
-    while True: time.sleep(10)
+    # Gửi báo cáo định kỳ mỗi 60 phút
+    while True:
+        time.sleep(3600)
+        get_market_report()
 
 if __name__ == "__main__":
     threading.Thread(target=start_bot, daemon=True).start()
