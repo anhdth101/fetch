@@ -4,12 +4,13 @@ import pytz
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# ================= CONFIG =================
+# ================= 1. CẤU HÌNH =================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "5047088212")
 SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 TIMEZONE = pytz.timezone("Asia/Ho_Chi_Minh")
 
+# Lịch gửi báo cáo
 REPORT_SCHEDULE = [
     (7, 0, "T-60m"), (7, 30, "T-30m"), (7, 45, "T-15m"), (7, 55, "T-5m"),
     (15, 0, "T-60m"), (15, 30, "T-30m"), (15, 45, "T-15m"), (15, 55, "T-5m"),
@@ -18,93 +19,68 @@ REPORT_SCHEDULE = [
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("BattlefieldBot")
-
-# Dùng OKX để tránh lỗi 451 trên Render
 exchange = ccxt.okx({"enableRateLimit": True, "timeout": 30000, "options": {"defaultType": "swap"}})
 
+# ================= 2. HÀM GỬI TELEGRAM =================
 def send_telegram(text):
-    if not TELEGRAM_TOKEN: return
+    if not TELEGRAM_TOKEN or "token" in TELEGRAM_TOKEN.lower():
+        logger.error("Token chưa đúng! Kiểm tra Env Vars trên Render.")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    try: requests.post(url, data=payload, timeout=15)
-    except Exception as e: logger.error(f"Telegram Error: {e}")
-
-# ================= LOGIC DỮ LIỆU =================
-def fetch_full_data(symbol):
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
-        ticker = exchange.fetch_ticker(symbol)
-        price = ticker['last']
-        
-        # 1. Buy/Sell Pressure (Orderbook)
-        ob = exchange.fetch_order_book(symbol, limit=20)
-        bids_v = sum(b[1] for b in ob['bids'])
-        asks_v = sum(a[1] for a in ob['asks'])
-        pressure = round(bids_v / asks_v, 2) if asks_v > 0 else 1.0
-
-        # 2. Funding & Open Interest
-        funding = exchange.fetch_funding_rate(symbol).get('fundingRate', 0) * 100
-        oi_data = exchange.fetch_open_interest(symbol)
-        oi_usd = float(oi_data.get('openInterestAmount', 0)) * price
-
-        # 3. OI Delta & Momentum (Tính toán đa khung thời gian)
-        oi_deltas, moms = {}, {}
-        for tf in ["5m", "15m", "30m", "1h", "4h", "8h", "1d"]:
-            ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=2)
-            if len(ohlcv) >= 2:
-                change = ((ohlcv[-1][4] - ohlcv[-2][4]) / ohlcv[-2][4]) * 100
-                moms[tf] = round(change, 2)
-                # Giả lập OI Delta dựa trên tương quan Volume/Price (OKX API chuẩn cần Key)
-                oi_deltas[tf] = round(change * 0.92, 2) 
-
-        # 4. Taker Flow (Xử lý nhãn dựa trên Momentum 5m)
-        label = "TAKER BUYING MẠNH" if moms['5m'] > 0.1 else "TAKER SELLING MẠNH" if moms['5m'] < -0.1 else "NEUTRAL"
-        taker_pct = round(50 + (moms['5m'] * 10), 1)
-        taker_pct = max(min(taker_pct, 99.9), 0.1)
-
-        return {
-            "p": price, "h": ticker['high'], "l": ticker['low'], "v": ticker['quoteVolume'],
-            "f": funding, "oi": oi_usd, "pr": pressure, "tf": taker_pct, "lb": label,
-            "oid": oi_deltas, "mom": moms
-        }
+        r = requests.post(url, data=payload, timeout=15)
+        logger.info(f"Telegram Resp: {r.status_code}")
     except Exception as e:
-        logger.error(f"Error {symbol}: {e}")
-        return None
+        logger.error(f"Lỗi gửi tin nhắn: {e}")
 
-def generate_report(label):
-    now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S VN")
-    msg = f"🔥 <b>BATTLEFIELD INTELLIGENCE REPORT v2.0</b>\n[{label}] | Time: {now}\n\n"
+# ================= 3. LẤY DATA & GỬI BÁO CÁO =================
+def fetch_and_report(label):
+    now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    msg = f"🔥 <b>BATTLEFIELD v2.1</b>\n[{label}] | {now}\n\n"
     
-    for asset, sym in [("BTC", "BTC/USDT:USDT"), ("ETH", "ETH/USDT:USDT")]:
-        d = fetch_full_data(sym)
-        if not d: continue
-        
-        # Format màu sắc
-        f_icon = "🔴" if d['f'] < 0 else "🟢"
-        oid_str = " | ".join([f"{k}:{'🟢+' if v > 0 else '🔴'}{v}%" for k, v in d['oid'].items() if k in ["5m", "15m", "30m", "1h"]])
-        mom_str = " | ".join([f"{k}: {'🟢+' if v > 0 else '🔴'}{v}%" for k, v in d['mom'].items()])
+    for sym in SYMBOLS:
+        try:
+            ticker = exchange.fetch_ticker(sym)
+            p = ticker['last']
+            oi_data = exchange.fetch_open_interest(sym)
+            oi_usd = float(oi_data.get('openInterestAmount', 0)) * p
+            
+            # Momentum 5m
+            ohlcv = exchange.fetch_ohlcv(sym, "5m", limit=2)
+            mom5m = round(((ohlcv[-1][4] - ohlcv[-2][4]) / ohlcv[-2][4]) * 100, 2) if len(ohlcv) >=2 else 0
+            icon = "🟢+" if mom5m > 0 else "🔴"
 
-        msg += (f"<b>{asset}</b> - High: {d['h']:,.1f} - Low: {d['l']:,.1f} - Current: <b>{d['p']:,.1f}</b> | Vol: {d['v']:,.0f} USDT | "
-                f"Funding: {f_icon}{d['f']:.4f}% | Pressure: {d['pr']}x | <b>OI: {d['oi']:,.0f} USD</b> | "
-                f"<b>Flow: {d['tf']}% ({d['lb']})</b> | <b>OI Δ: {oid_str}</b> | "
-                f"Momentum: {mom_str}\n\n")
+            msg += f"<b>{sym.split('/')[0]}</b>: {p:,.1f}\nOI: ${oi_usd:,.0f}\nΔ5m: {icon}{mom5m}%\n\n"
+        except: continue
     
     send_telegram(msg)
 
-# ================= KHỞI CHẠY =================
+# ================= 4. KHỞI CHẠY (BẮT BUỘC ĐÚNG FORM) =================
 app = Flask(__name__)
+
 @app.route("/")
-def health(): return "Bot Online", 200
+def health(): return "ONLINE", 200
 
-def bot_run():
-    time.sleep(5)
-    generate_report("STARTUP TEST")
-    scheduler.start()
-
-scheduler = BackgroundScheduler(timezone="Asia/Ho_Chi_Minh")
-for h, m, l in REPORT_SCHEDULE:
-    scheduler.add_job(generate_report, "cron", hour=h, minute=m, args=[l])
+def run_scheduler():
+    # Gửi tin nhắn TEST ngay lập tức khi vừa bật
+    logger.info("BẮT ĐẦU GỬI TIN NHẮN STARTUP...")
+    send_telegram("🚀 <b>BOT ĐÃ LIVE!</b>\nĐang chuẩn bị quét dữ liệu...")
+    fetch_and_report("STARTUP TEST")
+    
+    # Chạy lịch trình
+    sched = BackgroundScheduler(timezone="Asia/Ho_Chi_Minh")
+    for h, m, l in REPORT_SCHEDULE:
+        sched.add_job(fetch_and_report, "cron", hour=h, minute=m, args=[l])
+    sched.start()
+    while True: time.sleep(60) # Giữ thread này sống
 
 if __name__ == "__main__":
-    threading.Thread(target=bot_run, daemon=True).start()
+    # Chạy logic bot trong thread riêng
+    t = threading.Thread(target=run_scheduler, daemon=True)
+    t.start()
+    
+    # Chạy Flask ở luồng chính (Main Thread)
     port = int(os.environ.get("PORT", 10000))
+    logger.info(f"Khởi chạy Flask trên Port {port}")
     app.run(host="0.0.0.0", port=port)
